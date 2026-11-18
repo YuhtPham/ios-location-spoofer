@@ -1,10 +1,20 @@
 /*
- * 拦截 Apple /clls/wloc 接口的回应，解 ARPC 封包，改 WiFi 热点和基站坐标，
- * 再按 Apple 的格式封回去返回给系统。
+ * Intercept Apple /clls/wloc responses, unwrap the ARPC envelope, rewrite the
+ * WiFi hotspot and cell tower coordinates in the protobuf payload, then wrap it
+ * back in Apple's original format.
  *
- * 主要流程：
- *   ARPC 拆包 → protobuf 解字段 → 替换 Location 子消息的坐标/精度/运动状态
- *   → protobuf 重新打包 → 按原格式（ARPC / marker / synthetic）封回
+ * Flow:
+ *   ARPC unwrap -> protobuf parse -> replace Location submessage coords/accuracy/motion
+ *   -> protobuf re-pack -> re-wrap in original format (ARPC / marker / synthetic)
+ *
+ * v2 (2026-11-18)
+ *   - dedicated prepare pass: Accept-Encoding: identity + no-cache
+ *   - preserve original Content-Type, add no-store so nothing caches the fake fix
+ *   - multi-API decompress fallback (ungzip/gunzip/inflate/brotliDecompress)
+ *   - lenient payload extraction instead of hard failure
+ *   - only patch HTTP 200
+ *   - loud diagnostics when the body is empty
+ *   - sanitize accuracy values
  */
 (function () {
   "use strict";
@@ -410,7 +420,7 @@
   }
 
   function coordToInt(value) {
-    // 使用 Math.trunc 精确匹配 Go: int64(coord * 1e8)
+    // Use Math.trunc to exactly match Go: int64(coord * 1e8)
     return Math.trunc(Number(value) * 100000000);
   }
 
@@ -471,6 +481,21 @@
     if (!Number.isFinite(cfg.longitude) || cfg.longitude < -180 || cfg.longitude > 180) {
       throw new Error("invalid longitude");
     }
+
+    // Sanitize values that would make the fake fix obviously bogus.
+    if (!Number.isFinite(cfg.horizontalAccuracy) || cfg.horizontalAccuracy < 1) {
+      cfg.horizontalAccuracy = DEFAULT_CONFIG.horizontalAccuracy;
+    }
+    if (!Number.isFinite(cfg.verticalAccuracy) || cfg.verticalAccuracy < 1) {
+      cfg.verticalAccuracy = DEFAULT_CONFIG.verticalAccuracy;
+    }
+    if (!Number.isFinite(cfg.altitude)) {
+      cfg.altitude = DEFAULT_CONFIG.altitude;
+    }
+    if (!Number.isFinite(cfg.unknownValue4) || cfg.unknownValue4 < 0) {
+      cfg.unknownValue4 = DEFAULT_CONFIG.unknownValue4;
+    }
+
     return cfg;
   }
 
@@ -716,6 +741,15 @@
 
     // Shape 4: bare protobuf payload (best effort).
     if (looksLikeAppleWLocPayload(responseBytes)) {
+      return {
+        kind: "bare",
+        payload: responseBytes
+      };
+    }
+
+    // Shape 5: lenient – if the whole body parses as protobuf, try patching it
+    // anyway instead of failing outright.
+    if (tryParseFields(responseBytes) !== null) {
       return {
         kind: "bare",
         payload: responseBytes
@@ -1403,17 +1437,24 @@
   function headersWithBinaryBody(sourceHeaders, length) {
     var headers = {};
     var key;
+    var originalType = null;
     sourceHeaders = sourceHeaders || {};
     for (key in sourceHeaders) {
       if (Object.prototype.hasOwnProperty.call(sourceHeaders, key)) {
         var lower = key.toLowerCase();
-        if (lower !== "content-length" && lower !== "content-encoding" && lower !== "transfer-encoding") {
-          headers[key] = sourceHeaders[key];
+        if (lower === "content-length" || lower === "content-encoding" || lower === "transfer-encoding") {
+          continue;
         }
+        if (lower === "content-type") {
+          originalType = sourceHeaders[key];
+          continue;
+        }
+        headers[key] = sourceHeaders[key];
       }
     }
-    headers["Content-Type"] = "application/octet-stream";
+    headers["Content-Type"] = originalType || "application/octet-stream";
     headers["Content-Length"] = String(length);
+    headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
     return headers;
   }
 
@@ -1432,7 +1473,10 @@
   }
 
   function prepareRequestHeaders(headers) {
-    return setHeader(headers || {}, "Accept-Encoding", "identity");
+    headers = setHeader(headers || {}, "Accept-Encoding", "identity");
+    headers = setHeader(headers, "Cache-Control", "no-cache");
+    headers = setHeader(headers, "Pragma", "no-cache");
+    return headers;
   }
 
   function donePreparedRequestPassThrough() {
@@ -1443,7 +1487,7 @@
   }
 
   // Decode an HTTP response body that may be gzip/deflate/br encoded.
-  // Shadowrocket/Surge expose $utils.ungzip; Loon falls back to DecompressionStream.
+  // Tries every decompressor the runtime exposes, then gives up quietly.
   function decompressBody(body, contentEncoding) {
     if (body == null) {
       return body;
@@ -1452,20 +1496,32 @@
     if (enc === "identity" || enc === "") {
       return body;
     }
-    try {
-      if (enc.indexOf("gzip") >= 0 && typeof $utils !== "undefined" && $utils.ungzip) {
-        return $utils.ungzip(body);
+
+    var tries = [];
+    if (enc.indexOf("gzip") >= 0) {
+      tries = ["ungzip", "gunzip", "inflate"];
+    } else if (enc.indexOf("deflate") >= 0) {
+      tries = ["inflate", "ungzip"];
+    } else if (enc.indexOf("br") >= 0) {
+      tries = ["brotliDecompress", "decompress"];
+    }
+
+    for (var i = 0; i < tries.length; i += 1) {
+      try {
+        if (typeof $utils !== "undefined" && typeof $utils[tries[i]] === "function") {
+          var out = $utils[tries[i]](body);
+          var outBytes = bodyToBytes(out);
+          if (outBytes && outBytes.length > 2 && !isGzipBytes(outBytes)) {
+            return out;
+          }
+        }
+      } catch (err) {
+        // try the next decompressor
       }
-      if (enc.indexOf("deflate") >= 0 && typeof $utils !== "undefined" && $utils.inflate) {
-        return $utils.inflate(body);
-      }
-      if (enc.indexOf("br") >= 0 && typeof $utils !== "undefined" && $utils.brotliDecompress) {
-        return $utils.brotliDecompress(body);
-      }
-    } catch (err) {
-      if (typeof console !== "undefined") {
-        console.log("Location spoofer decompress failed (" + enc + "): " + err.message);
-      }
+    }
+
+    if (typeof console !== "undefined") {
+      console.log("Location spoofer decompress failed (" + enc + ")");
     }
     return body;
   }
@@ -1479,6 +1535,9 @@
 
     var bytes = bodyToBytes(rawRespBody);
     if (!bytes || bytes.length < 2) {
+      if (config.debug) {
+        console.log("Location spoofer wire body empty before decode (len=" + (bytes ? bytes.length : 0) + ")");
+      }
       return;
     }
 
@@ -1495,15 +1554,14 @@
         console.log(
           "Location spoofer gzip body still compressed (len=" +
             bytes.length +
-            "); ensure http-request prepare script is enabled"
+            "); thử parse trực tiếp – kiểm tra prepare script"
         );
       }
-      return;
     }
 
     if (contentEncoding) {
       var plain = bodyToBytes(decompressBody(rawRespBody, contentEncoding));
-      if (plain) {
+      if (plain && plain.length > 2 && !isGzipBytes(plain)) {
         $response.body = plain;
       }
     }
@@ -1778,14 +1836,25 @@
   }
 
   function continueResponseRewrite(config) {
+    var rawStatus = ($response && ($response.status || $response.statusCode)) || 200;
+    var statusNum = parseInt(String(rawStatus).replace(/[^0-9]/g, ""), 10) || 200;
+    if (statusNum !== 200) {
+      if (config.debug) {
+        console.log("Location spoofer skip non-200 status: " + statusNum);
+      }
+      donePassThrough();
+      return;
+    }
+
     var responseBody = messageBodyToBytes($response);
     if (!responseBody || responseBody.length < 2) {
       if (config.debug) {
         console.log(
-          "Location spoofer response body too short: " +
+          "Location spoofer response body rỗng (" +
             (responseBody ? responseBody.length : 0) +
             " bytes, head=" +
-            (responseBody ? hexPreview(responseBody) : "<none>")
+            (responseBody ? hexPreview(responseBody) : "<none>") +
+            ") – kiểm tra prepare script và Accept-Encoding"
         );
       }
       donePassThrough();
@@ -1842,7 +1911,7 @@
     if (hasRequest && !hasResponse) {
       var prepArgs = readScriptArguments();
       if (parseBoolean(prepArgs.debug, false)) {
-        console.log("Location spoofer prepare -> Accept-Encoding: identity");
+        console.log("Location spoofer prepare -> Accept-Encoding: identity, Cache-Control: no-cache");
       }
       donePreparedRequestPassThrough();
       return;
@@ -1977,7 +2046,8 @@
     parseArgumentString: parseArgumentString,
     readScriptArguments: readScriptArguments,
     geocodeAddress: geocodeAddress,
-    prepareRequestHeaders: prepareRequestHeaders
+    prepareRequestHeaders: prepareRequestHeaders,
+    decompressBody: decompressBody
   };
 
   if (typeof module !== "undefined" && module.exports) {
